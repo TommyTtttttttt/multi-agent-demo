@@ -1,344 +1,198 @@
 /**
  * Planner Agent
  *
- * 负责分析 Figma 设计稿，识别组件，制定开发计划
+ * 分析 Figma 设计稿，输出 JSON 格式的开发计划
+ * 使用 Claude CLI 的内置能力（无需自定义工具）
  */
 
 import { BaseAgent } from './base.js';
 
-const PLANNER_SYSTEM_PROMPT = `你是一个资深前端架构师 Agent，负责分析 Figma 设计稿并规划组件开发任务。
+const PLANNER_SYSTEM_PROMPT = `你是一个资深前端架构师，负责分析 Figma 设计稿并规划组件开发任务。
 
 ## 你的职责
 
-1. 分析 Figma 设计稿结构
-2. 识别所有需要开发的 UI 组件
-3. 提取设计 tokens（颜色、字体、间距）
-4. 分析组件依赖关系
-5. 制定合理的开发计划
+1. 分析设计稿结构，识别所有 UI 组件
+2. 提取设计 tokens（颜色、字体、间距）
+3. 分析组件依赖关系，制定开发优先级
+4. 输出结构化的 JSON 开发计划
 
-## 组件识别原则
+## 组件分类原则
 
-1. **原子组件** (priority: 1)
-   - Button, Input, Icon, Badge, Avatar
-   - 无依赖，最先开发
+- **priority 1** (原子组件): Button, Input, Icon, Badge - 无依赖，最先开发
+- **priority 2** (分子组件): Card, ListItem, FormField - 依赖原子组件
+- **priority 3** (有机体): Header, Sidebar, Modal - 依赖分子组件
+- **priority 4** (页面): Dashboard, Settings - 依赖有机体组件
 
-2. **分子组件** (priority: 2)
-   - Card, ListItem, MenuItem, FormField
-   - 依赖原子组件
+## 输出格式要求
 
-3. **有机体组件** (priority: 3)
-   - Header, Sidebar, Footer, Modal, Form
-   - 依赖分子组件
-
-4. **模板/页面组件** (priority: 4)
-   - Dashboard, Profile, Settings
-   - 依赖有机体组件
-
-## 输出要求
-
-- 组件命名使用 kebab-case (如 user-card, nav-header)
-- 每个组件必须包含: name, description, priority, dependencies
-- 必须提取 designTokens（颜色、间距、字体）`;
-
-const PLANNER_TOOLS = [
-  {
-    name: 'analyze_figma_structure',
-    description: '分析 Figma 文件结构，获取所有页面和帧',
-    input_schema: {
-      type: 'object',
-      properties: {
-        file_key: {
-          type: 'string',
-          description: 'Figma 文件的 key'
-        }
-      },
-      required: ['file_key']
-    }
-  },
-  {
-    name: 'get_figma_node_details',
-    description: '获取特定 Figma 节点的详细信息（样式、子节点、属性）',
-    input_schema: {
-      type: 'object',
-      properties: {
-        file_key: { type: 'string' },
-        node_id: { type: 'string' }
-      },
-      required: ['file_key', 'node_id']
-    }
-  },
-  {
-    name: 'get_figma_styles',
-    description: '获取 Figma 文件中定义的样式（颜色、文本、效果）',
-    input_schema: {
-      type: 'object',
-      properties: {
-        file_key: { type: 'string' }
-      },
-      required: ['file_key']
-    }
-  },
-  {
-    name: 'create_development_plan',
-    description: '创建最终的组件开发计划',
-    input_schema: {
-      type: 'object',
-      properties: {
-        components: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              name: { type: 'string', description: '组件名称 (kebab-case)' },
-              nodeId: { type: 'string', description: 'Figma 节点 ID' },
-              description: { type: 'string', description: '组件描述' },
-              priority: { type: 'number', description: '开发优先级 1-4' },
-              dependencies: {
-                type: 'array',
-                items: { type: 'string' },
-                description: '依赖的其他组件'
-              },
-              complexity: {
-                type: 'string',
-                enum: ['low', 'medium', 'high'],
-                description: '复杂度评估'
-              },
-              props: {
-                type: 'array',
-                items: { type: 'string' },
-                description: '预期的组件 props'
-              }
-            },
-            required: ['name', 'description', 'priority']
-          }
-        },
-        designTokens: {
-          type: 'object',
-          properties: {
-            colors: { type: 'object' },
-            spacing: { type: 'object' },
-            typography: { type: 'object' },
-            shadows: { type: 'object' },
-            borderRadius: { type: 'object' }
-          },
-          description: '提取的设计 tokens'
-        },
-        summary: {
-          type: 'string',
-          description: '计划摘要'
-        }
-      },
-      required: ['components', 'designTokens', 'summary']
-    }
-  }
-];
+必须输出有效的 JSON，包含：
+- components: 组件数组，每个包含 name, description, priority, dependencies, complexity, props
+- designTokens: 包含 colors, spacing, typography, borderRadius, shadows
+- summary: 计划摘要`;
 
 export class PlannerAgent extends BaseAgent {
-  constructor(orchestrator) {
-    super('Planner', PLANNER_SYSTEM_PROMPT, PLANNER_TOOLS);
-    this.orchestrator = orchestrator;
-    this.developmentPlan = null;
+  constructor() {
+    super('Planner', PLANNER_SYSTEM_PROMPT);
   }
 
   /**
-   * 分析 Figma 设计稿并生成开发计划
+   * 分析设计稿并生成开发计划
    */
   async analyzeDesign(figmaUrl) {
     const fileKey = this.extractFileKey(figmaUrl);
+    this.log(`分析 Figma 设计稿: ${fileKey}`);
 
-    this.log(`开始分析 Figma 设计稿: ${fileKey}`);
+    // 如果是 demo 模式，返回模拟数据
+    if (figmaUrl === 'demo' || !figmaUrl) {
+      this.log('使用演示数据');
+      return this.getMockPlan();
+    }
 
-    const result = await this.run(`
-请分析这个 Figma 设计稿并创建完整的前端组件开发计划。
+    const task = `
+分析以下 Figma 设计稿并生成开发计划：
 
-## Figma 信息
-- File Key: ${fileKey}
-- URL: ${figmaUrl}
+Figma URL: ${figmaUrl}
+File Key: ${fileKey}
 
-## 任务步骤
+请：
+1. 识别设计稿中的所有可复用组件
+2. 提取设计 tokens（颜色、间距、字体等）
+3. 分析组件依赖关系
+4. 按优先级排序组件
 
-1. **分析结构**: 使用 analyze_figma_structure 获取文件整体结构
-2. **获取样式**: 使用 get_figma_styles 提取设计 tokens
-3. **识别组件**: 根据设计稿识别所有需要开发的组件
-4. **分析依赖**: 确定组件之间的依赖关系
-5. **制定计划**: 使用 create_development_plan 输出最终计划
+输出 JSON 格式的开发计划，结构如下：
+{
+  "components": [
+    {
+      "name": "button",
+      "description": "主按钮组件",
+      "priority": 1,
+      "complexity": "low",
+      "dependencies": [],
+      "props": ["variant", "size", "disabled", "onClick"]
+    }
+  ],
+  "designTokens": {
+    "colors": { "primary": "#3B82F6", ... },
+    "spacing": { "sm": "8px", ... },
+    "typography": { ... },
+    "borderRadius": { ... },
+    "shadows": { ... }
+  },
+  "summary": "计划摘要"
+}`;
 
-## 注意事项
+    try {
+      const result = await this.execute(task, {
+        allowedTools: ['Read', 'WebFetch'],
+        jsonOutput: true
+      });
 
-- 优先识别可复用的基础组件
-- 提取所有颜色、间距、字体作为 design tokens
-- 考虑组件的变体（hover, active, disabled 等状态）
-- 给出合理的 props 建议
-    `);
+      if (result.components && result.designTokens) {
+        // 按优先级排序
+        result.components.sort((a, b) => a.priority - b.priority);
+        this.log(`识别到 ${result.components.length} 个组件`, 'success');
+        return result;
+      }
 
-    return this.developmentPlan;
+      // 如果解析失败，返回模拟数据
+      this.log('无法解析计划，使用默认数据', 'warn');
+      return this.getMockPlan();
+
+    } catch (error) {
+      this.log(`分析失败: ${error.message}`, 'error');
+      return this.getMockPlan();
+    }
   }
 
   /**
-   * 从 Figma URL 提取 file key
+   * 从 URL 提取 file key
    */
   extractFileKey(url) {
-    // 支持多种 Figma URL 格式
-    // https://www.figma.com/file/ABC123/name
-    // https://www.figma.com/design/ABC123/name
-    // https://figma.com/file/ABC123/name
+    if (!url || url === 'demo') return 'demo';
     const match = url.match(/figma\.com\/(?:file|design)\/([a-zA-Z0-9]+)/);
-    if (match) {
-      return match[1];
-    }
-    // 如果不是 URL，假设直接是 file key
-    return url;
+    return match ? match[1] : url;
   }
 
   /**
-   * 执行工具
+   * 模拟开发计划（演示用）
    */
-  async executeTool(name, input) {
-    switch (name) {
-      case 'analyze_figma_structure':
-        return await this.analyzeFigmaStructure(input);
-
-      case 'get_figma_node_details':
-        return await this.getFigmaNodeDetails(input);
-
-      case 'get_figma_styles':
-        return await this.getFigmaStyles(input);
-
-      case 'create_development_plan':
-        return this.createDevelopmentPlan(input);
-
-      default:
-        throw new Error(`未知工具: ${name}`);
-    }
-  }
-
-  /**
-   * 分析 Figma 结构 - 通过 MCP 或模拟
-   */
-  async analyzeFigmaStructure({ file_key }) {
-    // 如果有 MCP 连接，使用 MCP
-    if (this.orchestrator.mcpClient) {
-      return await this.orchestrator.callMcp('figma_get_file', { file_key });
-    }
-
-    // 否则返回模拟数据（用于演示）
-    this.log('使用模拟数据（未连接 Figma MCP）');
+  getMockPlan() {
     return {
-      name: 'Demo Design System',
-      lastModified: new Date().toISOString(),
-      pages: [
+      components: [
         {
-          id: 'page-1',
-          name: 'Components',
-          frames: [
-            { id: '1:2', name: 'Button', type: 'COMPONENT' },
-            { id: '1:10', name: 'Input', type: 'COMPONENT' },
-            { id: '1:20', name: 'Card', type: 'COMPONENT' },
-            { id: '1:30', name: 'Header', type: 'COMPONENT' },
-            { id: '1:40', name: 'Sidebar', type: 'COMPONENT' },
-            { id: '1:50', name: 'Modal', type: 'COMPONENT' }
-          ]
+          name: 'button',
+          description: '通用按钮组件，支持多种变体和尺寸',
+          priority: 1,
+          complexity: 'low',
+          dependencies: [],
+          props: ['variant', 'size', 'disabled', 'loading', 'onClick', 'children']
         },
         {
-          id: 'page-2',
-          name: 'Pages',
-          frames: [
-            { id: '2:1', name: 'Dashboard', type: 'FRAME' },
-            { id: '2:2', name: 'Settings', type: 'FRAME' }
-          ]
+          name: 'input',
+          description: '文本输入框组件',
+          priority: 1,
+          complexity: 'low',
+          dependencies: [],
+          props: ['type', 'placeholder', 'value', 'onChange', 'error', 'disabled']
+        },
+        {
+          name: 'card',
+          description: '卡片容器组件',
+          priority: 2,
+          complexity: 'medium',
+          dependencies: ['button'],
+          props: ['title', 'children', 'footer', 'hoverable']
+        },
+        {
+          name: 'header',
+          description: '页面顶部导航栏',
+          priority: 3,
+          complexity: 'medium',
+          dependencies: ['button'],
+          props: ['logo', 'navItems', 'user', 'onLogout']
         }
-      ]
-    };
-  }
-
-  /**
-   * 获取节点详情
-   */
-  async getFigmaNodeDetails({ file_key, node_id }) {
-    if (this.orchestrator.mcpClient) {
-      return await this.orchestrator.callMcp('figma_get_node', { file_key, node_id });
-    }
-
-    // 模拟数据
-    return {
-      id: node_id,
-      name: 'Component',
-      type: 'COMPONENT',
-      children: [],
-      styles: {
-        fill: '#3B82F6',
-        stroke: 'none'
-      }
-    };
-  }
-
-  /**
-   * 获取 Figma 样式
-   */
-  async getFigmaStyles({ file_key }) {
-    if (this.orchestrator.mcpClient) {
-      return await this.orchestrator.callMcp('figma_get_styles', { file_key });
-    }
-
-    // 模拟设计 tokens
-    return {
-      colors: {
-        'primary': '#3B82F6',
-        'primary-dark': '#2563EB',
-        'secondary': '#10B981',
-        'background': '#FFFFFF',
-        'surface': '#F3F4F6',
-        'text-primary': '#111827',
-        'text-secondary': '#6B7280',
-        'border': '#E5E7EB',
-        'error': '#EF4444',
-        'warning': '#F59E0B',
-        'success': '#10B981'
+      ],
+      designTokens: {
+        colors: {
+          'primary': '#3B82F6',
+          'primary-dark': '#2563EB',
+          'secondary': '#10B981',
+          'background': '#FFFFFF',
+          'surface': '#F3F4F6',
+          'text-primary': '#111827',
+          'text-secondary': '#6B7280',
+          'border': '#E5E7EB',
+          'error': '#EF4444',
+          'success': '#10B981'
+        },
+        spacing: {
+          'xs': '4px',
+          'sm': '8px',
+          'md': '16px',
+          'lg': '24px',
+          'xl': '32px'
+        },
+        typography: {
+          'font-family': 'Inter, system-ui, sans-serif',
+          'font-size-sm': '14px',
+          'font-size-base': '16px',
+          'font-size-lg': '18px',
+          'font-size-xl': '20px'
+        },
+        borderRadius: {
+          'sm': '4px',
+          'md': '8px',
+          'lg': '12px',
+          'full': '9999px'
+        },
+        shadows: {
+          'sm': '0 1px 2px rgba(0,0,0,0.05)',
+          'md': '0 4px 6px rgba(0,0,0,0.1)',
+          'lg': '0 10px 15px rgba(0,0,0,0.1)'
+        }
       },
-      typography: {
-        'heading-1': { fontSize: '32px', fontWeight: '700', lineHeight: '1.2' },
-        'heading-2': { fontSize: '24px', fontWeight: '600', lineHeight: '1.3' },
-        'heading-3': { fontSize: '20px', fontWeight: '600', lineHeight: '1.4' },
-        'body': { fontSize: '16px', fontWeight: '400', lineHeight: '1.5' },
-        'body-small': { fontSize: '14px', fontWeight: '400', lineHeight: '1.5' },
-        'caption': { fontSize: '12px', fontWeight: '400', lineHeight: '1.4' }
-      },
-      spacing: {
-        'xs': '4px',
-        'sm': '8px',
-        'md': '16px',
-        'lg': '24px',
-        'xl': '32px',
-        '2xl': '48px'
-      },
-      borderRadius: {
-        'sm': '4px',
-        'md': '8px',
-        'lg': '12px',
-        'full': '9999px'
-      },
-      shadows: {
-        'sm': '0 1px 2px rgba(0,0,0,0.05)',
-        'md': '0 4px 6px rgba(0,0,0,0.1)',
-        'lg': '0 10px 15px rgba(0,0,0,0.1)'
-      }
-    };
-  }
-
-  /**
-   * 创建开发计划
-   */
-  createDevelopmentPlan(plan) {
-    this.developmentPlan = plan;
-    this.log(`开发计划已创建: ${plan.components.length} 个组件`, 'success');
-
-    // 按优先级排序
-    plan.components.sort((a, b) => a.priority - b.priority);
-
-    return {
-      success: true,
-      componentsCount: plan.components.length,
-      summary: plan.summary
+      summary: '演示计划：4个组件（2个原子组件、1个分子组件、1个有机体组件）'
     };
   }
 }
