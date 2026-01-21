@@ -1,0 +1,20 @@
+{
+  "name": "multi-agent-demo",
+  "version": "1.0.0",
+  "description": "Multi-agent system for building frontend from Figma designs",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "build": "node scripts/build-from-figma.js",
+    "setup-worktrees": "bash scripts/setup-worktrees.sh",
+    "clean-worktrees": "bash scripts/clean-worktrees.sh",
+    "demo": "node scripts/demo.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0"
+  },
+  "devDependencies": {
+    "p-limit": "^5.0.0"
+  }
+}
