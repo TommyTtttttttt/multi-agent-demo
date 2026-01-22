@@ -1,20 +1,27 @@
 /**
  * Planner Agent
  *
- * 分析 Figma 设计稿，输出 JSON 格式的开发计划
- * 使用 Claude CLI 的内置能力（无需自定义工具）
+ * 通过 Figma MCP 获取真实设计数据，输出 JSON 格式的开发计划
  */
 
 import { BaseAgent } from './base.js';
 
 const PLANNER_SYSTEM_PROMPT = `你是一个资深前端架构师，负责分析 Figma 设计稿并规划组件开发任务。
 
+## 重要：你可以使用 Figma MCP 工具
+
+你可以调用以下 MCP 工具来获取真实的 Figma 设计数据：
+- mcp__figma__get_file: 获取 Figma 文件结构
+- mcp__figma__get_file_styles: 获取设计样式（颜色、字体等）
+- mcp__figma__get_file_components: 获取组件列表
+
 ## 你的职责
 
-1. 分析设计稿结构，识别所有 UI 组件
-2. 提取设计 tokens（颜色、字体、间距）
-3. 分析组件依赖关系，制定开发优先级
-4. 输出结构化的 JSON 开发计划
+1. 使用 MCP 工具获取 Figma 设计数据
+2. 分析设计结构，识别所有 UI 组件
+3. 提取设计 tokens（颜色、字体、间距）
+4. 分析组件依赖关系，制定开发优先级
+5. 输出结构化的 JSON 开发计划
 
 ## 组件分类原则
 
@@ -26,8 +33,9 @@ const PLANNER_SYSTEM_PROMPT = `你是一个资深前端架构师，负责分析 
 ## 输出格式要求
 
 必须输出有效的 JSON，包含：
-- components: 组件数组，每个包含 name, description, priority, dependencies, complexity, props
+- components: 组件数组，每个包含 name, description, priority, dependencies, complexity, props, figmaNodeId
 - designTokens: 包含 colors, spacing, typography, borderRadius, shadows
+- figmaMetadata: 包含 fileKey, fileName, lastModified
 - summary: 计划摘要`;
 
 export class PlannerAgent extends BaseAgent {
@@ -49,58 +57,76 @@ export class PlannerAgent extends BaseAgent {
     }
 
     const task = `
-分析以下 Figma 设计稿并生成开发计划：
+请分析以下 Figma 设计稿并生成开发计划：
 
 Figma URL: ${figmaUrl}
 File Key: ${fileKey}
 
-请：
-1. 识别设计稿中的所有可复用组件
-2. 提取设计 tokens（颜色、间距、字体等）
-3. 分析组件依赖关系
-4. 按优先级排序组件
+## 步骤
 
-输出 JSON 格式的开发计划，结构如下：
+1. 首先，使用 MCP 工具获取 Figma 文件数据：
+   - 调用 mcp__figma__get_file 获取文件结构 (fileKey: "${fileKey}")
+   - 调用 mcp__figma__get_file_styles 获取样式定义 (fileKey: "${fileKey}")
+
+2. 分析获取到的数据：
+   - 识别所有可复用的 UI 组件
+   - 提取颜色、字体、间距等设计 tokens
+   - 分析组件之间的依赖关系
+
+3. 输出 JSON 格式的开发计划：
+
 {
   "components": [
     {
-      "name": "button",
-      "description": "主按钮组件",
-      "priority": 1,
-      "complexity": "low",
-      "dependencies": [],
-      "props": ["variant", "size", "disabled", "onClick"]
+      "name": "组件名（小写，如 button）",
+      "description": "组件描述",
+      "priority": 1-4,
+      "complexity": "low/medium/high",
+      "dependencies": ["依赖的组件名"],
+      "props": ["组件属性列表"],
+      "figmaNodeId": "Figma 节点 ID（如果有）"
     }
   ],
   "designTokens": {
-    "colors": { "primary": "#3B82F6", ... },
+    "colors": { "primary": "#xxx", ... },
     "spacing": { "sm": "8px", ... },
-    "typography": { ... },
-    "borderRadius": { ... },
+    "typography": { "fontFamily": "...", ... },
+    "borderRadius": { "sm": "4px", ... },
     "shadows": { ... }
   },
-  "summary": "计划摘要"
-}`;
+  "figmaMetadata": {
+    "fileKey": "${fileKey}",
+    "fileName": "文件名",
+    "lastModified": "最后修改时间"
+  },
+  "summary": "计划摘要，包含组件数量和预估工作量"
+}
+
+只输出 JSON，不要其他内容。`;
 
     try {
       const result = await this.execute(task, {
-        allowedTools: ['Read', 'WebFetch'],
+        allowedTools: ['Read', 'WebFetch', 'mcp__figma__get_file', 'mcp__figma__get_file_styles', 'mcp__figma__get_file_components'],
         jsonOutput: true
       });
 
-      if (result.components && result.designTokens) {
+      if (result.components && result.components.length > 0) {
         // 按优先级排序
         result.components.sort((a, b) => a.priority - b.priority);
-        this.log(`识别到 ${result.components.length} 个组件`, 'success');
+        this.log(`✅ 从 Figma 识别到 ${result.components.length} 个组件`, 'success');
+
+        // 标记为真实数据
+        result._source = 'figma-mcp';
         return result;
       }
 
       // 如果解析失败，返回模拟数据
-      this.log('无法解析计划，使用默认数据', 'warn');
+      this.log('⚠️ 无法从 Figma 解析组件，使用默认数据', 'warn');
       return this.getMockPlan();
 
     } catch (error) {
-      this.log(`分析失败: ${error.message}`, 'error');
+      this.log(`❌ Figma 分析失败: ${error.message}`, 'error');
+      this.log('回退到模拟数据', 'warn');
       return this.getMockPlan();
     }
   }
@@ -119,6 +145,7 @@ File Key: ${fileKey}
    */
   getMockPlan() {
     return {
+      _source: 'mock',
       components: [
         {
           name: 'button',
@@ -191,6 +218,11 @@ File Key: ${fileKey}
           'md': '0 4px 6px rgba(0,0,0,0.1)',
           'lg': '0 10px 15px rgba(0,0,0,0.1)'
         }
+      },
+      figmaMetadata: {
+        fileKey: 'mock',
+        fileName: 'Demo Design',
+        lastModified: new Date().toISOString()
       },
       summary: '演示计划：4个组件（2个原子组件、1个分子组件、1个有机体组件）'
     };
