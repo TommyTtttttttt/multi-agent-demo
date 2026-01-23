@@ -7,6 +7,7 @@
 
 import { PlannerAgent } from './planner.js';
 import { WorkerAgent } from './worker.js';
+import { SimpleVisualizer } from '../utils/visualizer.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
@@ -26,6 +27,9 @@ export class Orchestrator {
 
     this.planner = new PlannerAgent();
     this.results = [];
+
+    // 可视化器
+    this.visualizer = config.visualizer || new SimpleVisualizer();
 
     // 效率统计指标
     this.metrics = {
@@ -87,12 +91,11 @@ export class Orchestrator {
    * Phase 1: 规划阶段
    */
   async runPlanningPhase(figmaUrl) {
-    console.log('━'.repeat(60));
-    console.log('📋 Phase 1: 分析设计稿');
-    console.log('━'.repeat(60));
+    this.visualizer.printPhaseStart(1, '分析设计稿');
 
     this.metrics.phases.planning.start = Date.now();
 
+    this.visualizer.printAgentStart('planner', 'Planner', '分析 Figma 设计稿...');
     const plan = await this.planner.analyzeDesign(figmaUrl);
 
     this.metrics.phases.planning.end = Date.now();
@@ -100,15 +103,18 @@ export class Orchestrator {
     this.metrics.dataSource = plan._source || 'unknown';
 
     if (!plan?.components?.length) {
+      this.visualizer.printAgentComplete('Planner', 'error', '未能生成有效计划');
       throw new Error('Planner 未能生成有效的开发计划');
     }
 
-    console.log(`\n✅ 识别到 ${plan.components.length} 个组件:`);
+    this.visualizer.printAgentComplete('Planner', 'success', `识别到 ${plan.components.length} 个组件`);
+
+    console.log(`\n   📋 组件列表:`);
     plan.components.forEach((c, i) => {
-      console.log(`   ${i + 1}. ${c.name} (优先级: ${c.priority}, 复杂度: ${c.complexity})`);
+      console.log(`      ${i + 1}. ${c.name} (优先级: ${c.priority}, 复杂度: ${c.complexity})`);
     });
-    console.log(`\n⏱️  规划耗时: ${(this.metrics.phases.planning.duration / 1000).toFixed(1)}s`);
-    console.log(`📊 数据来源: ${this.metrics.dataSource === 'figma-mcp' ? 'Figma MCP (真实数据)' : 'Mock (演示数据)'}`);
+    console.log(`\n   ⏱️  规划耗时: ${(this.metrics.phases.planning.duration / 1000).toFixed(1)}s`);
+    console.log(`   📊 数据来源: ${this.metrics.dataSource === 'figma-mcp' ? 'Figma MCP (真实数据)' : 'Mock (演示数据)'}`);
 
     // 保存 design tokens
     await this.saveDesignTokens(plan.designTokens);
@@ -120,27 +126,25 @@ export class Orchestrator {
    * Phase 2: Worktree 设置阶段
    */
   async runWorktreeSetupPhase(components) {
-    console.log('\n' + '━'.repeat(60));
-    console.log('📁 Phase 2: 创建 Git Worktrees');
-    console.log('━'.repeat(60) + '\n');
+    this.visualizer.printPhaseStart(2, '创建 Git Worktrees');
 
     this.metrics.phases.worktreeSetup.start = Date.now();
 
+    this.visualizer.printAgentStart('git', 'Git', `创建 ${components.length} 个 worktrees...`);
     await this.setupWorktrees(components);
+    this.visualizer.printAgentComplete('Git', 'success', `${components.length} 个 worktrees 已就绪`);
 
     this.metrics.phases.worktreeSetup.end = Date.now();
     this.metrics.phases.worktreeSetup.duration = this.metrics.phases.worktreeSetup.end - this.metrics.phases.worktreeSetup.start;
 
-    console.log(`\n⏱️  Worktree 设置耗时: ${(this.metrics.phases.worktreeSetup.duration / 1000).toFixed(1)}s`);
+    console.log(`\n   ⏱️  Worktree 设置耗时: ${(this.metrics.phases.worktreeSetup.duration / 1000).toFixed(1)}s`);
   }
 
   /**
    * Phase 3: 组件生成阶段
    */
   async runComponentGenerationPhase(components, designTokens) {
-    console.log('\n' + '━'.repeat(60));
-    console.log('🚀 Phase 3: 启动 Worker 智能体');
-    console.log('━'.repeat(60));
+    this.visualizer.printPhaseStart(3, '启动 Worker 智能体');
 
     this.metrics.phases.componentGeneration.start = Date.now();
     this.progress.total = components.length;
@@ -235,7 +239,7 @@ export const shadows = ${JSON.stringify(tokens.shadows || {}, null, 2)} as const
     const groups = this.groupByPriority(components);
 
     for (const [priority, group] of Object.entries(groups)) {
-      console.log(`\n--- 优先级 ${priority} (${group.length} 个组件) ---\n`);
+      console.log(`\n   📦 优先级 ${priority} (${group.length} 个组件)\n`);
 
       // 分批并行执行
       const chunks = this.chunk(group, this.config.maxParallelWorkers);
@@ -247,6 +251,9 @@ export const shadows = ${JSON.stringify(tokens.shadows || {}, null, 2)} as const
           const workingDir = existsSync(worktreePath)
             ? worktreePath
             : this.config.projectRoot;
+
+          // 显示 Worker 启动
+          this.visualizer.printAgentStart('worker', component.name, `生成 ${component.name} 组件...`);
 
           const worker = new WorkerAgent(component.name);
 
@@ -274,7 +281,13 @@ export const shadows = ${JSON.stringify(tokens.shadows || {}, null, 2)} as const
             this.progress.failed++;
           }
 
-          this.printProgress(component.name, result.status);
+          // 显示 Worker 完成
+          this.visualizer.printAgentComplete(
+            component.name,
+            result.status,
+            result.summary || (result.status === 'success' ? '组件已生成' : '生成失败')
+          );
+
           return result;
         });
 
@@ -284,15 +297,6 @@ export const shadows = ${JSON.stringify(tokens.shadows || {}, null, 2)} as const
     }
 
     return results;
-  }
-
-  /**
-   * 打印进度
-   */
-  printProgress(componentName, status) {
-    const icon = status === 'success' ? '✅' : '❌';
-    const progress = `[${this.progress.completed + this.progress.failed}/${this.progress.total}]`;
-    console.log(`   ${icon} ${progress} ${componentName}`);
   }
 
   /**
@@ -322,66 +326,23 @@ export const shadows = ${JSON.stringify(tokens.shadows || {}, null, 2)} as const
    * 打印标题
    */
   printHeader() {
-    console.log('\n' + '═'.repeat(60));
-    console.log('   🤖 Multi-Agent 前端开发系统');
-    console.log('═'.repeat(60));
-    console.log(`   启动时间: ${new Date().toLocaleString()}`);
-    console.log(`   并行度: ${this.config.maxParallelWorkers} workers`);
-    console.log('═'.repeat(60) + '\n');
+    console.log(`
+\x1b[1m\x1b[36m╔══════════════════════════════════════════════════════════════╗
+║     🤖 Multi-Agent Frontend Development System 🤖            ║
+╠══════════════════════════════════════════════════════════════╣
+║  🎯 Orchestrator  →  🧠 Planner  →  👷 Workers (×N)         ║
+╚══════════════════════════════════════════════════════════════╝\x1b[0m
+`);
+    console.log(`   📅 启动时间: ${new Date().toLocaleString()}`);
+    console.log(`   ⚡ 并行度: ${this.config.maxParallelWorkers} workers`);
+    console.log('');
   }
 
   /**
    * 打印汇总
    */
   printSummary(results) {
-    const totalDuration = (this.metrics.endTime - this.metrics.startTime) / 1000;
-    const success = results.filter(r => r.status === 'success').length;
-    const failed = results.filter(r => r.status === 'failed').length;
-
-    console.log('\n' + '═'.repeat(60));
-    console.log('   📊 执行报告');
-    console.log('═'.repeat(60));
-
-    // 流程可视化
-    console.log('\n   🔄 流程图:');
-    console.log('   ┌─────────────────────────────────────────────────────┐');
-    console.log(`   │  Figma Design  →  Planner Agent  →  Worker Agents  │`);
-    console.log('   │      📐              🧠                 👷×N        │');
-    console.log('   └─────────────────────────────────────────────────────┘');
-
-    // 各阶段耗时
-    console.log('\n   ⏱️  各阶段耗时:');
-    console.log(`      Phase 1 (规划):     ${(this.metrics.phases.planning.duration / 1000).toFixed(1)}s`);
-    console.log(`      Phase 2 (Worktree): ${(this.metrics.phases.worktreeSetup.duration / 1000).toFixed(1)}s`);
-    console.log(`      Phase 3 (生成):     ${(this.metrics.phases.componentGeneration.duration / 1000).toFixed(1)}s`);
-    console.log(`      ─────────────────────────`);
-    console.log(`      总计:               ${totalDuration.toFixed(1)}s`);
-
-    // 效率指标
-    const avgTimePerComponent = this.metrics.components.length > 0
-      ? this.metrics.components.reduce((sum, c) => sum + c.duration, 0) / this.metrics.components.length / 1000
-      : 0;
-
-    console.log('\n   📈 效率指标:');
-    console.log(`      组件总数:        ${results.length}`);
-    console.log(`      成功:            ${success} ✅`);
-    console.log(`      失败:            ${failed} ❌`);
-    console.log(`      成功率:          ${((success / results.length) * 100).toFixed(1)}%`);
-    console.log(`      平均耗时/组件:   ${avgTimePerComponent.toFixed(1)}s`);
-    console.log(`      数据来源:        ${this.metrics.dataSource === 'figma-mcp' ? 'Figma MCP ✅' : 'Mock Data'}`);
-
-    console.log('\n' + '═'.repeat(60));
-
-    // 组件详情
-    console.log('\n   📦 组件详情:');
-    results.forEach(r => {
-      const icon = r.status === 'success' ? '✅' : '❌';
-      const metric = this.metrics.components.find(m => m.name === r.component);
-      const duration = metric ? `${(metric.duration / 1000).toFixed(1)}s` : '-';
-      console.log(`      ${icon} ${r.component.padEnd(15)} ${duration.padStart(6)}  ${r.summary || ''}`);
-    });
-
-    console.log('\n' + '═'.repeat(60) + '\n');
+    this.visualizer.printSummary(results, this.metrics);
   }
 
   /**
